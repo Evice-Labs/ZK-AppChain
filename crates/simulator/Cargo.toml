@@ -1,0 +1,18 @@
+[package]
+name = "simulator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+common = { workspace = true }
+
+alloy = { workspace = true }
+alloy-primitives = { workspace = true }
+revm = { workspace = true }
+revm-primitives = { workspace = true }
+derive_more = { workspace = true }
+anyhow = { workspace = true }
+hex = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true }
+reqwest = { workspace = true }

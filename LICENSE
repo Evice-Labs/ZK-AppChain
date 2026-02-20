@@ -1,0 +1,30 @@
+Business Source License 1.1
+
+License heading:
+
+Copyright (c) 2026 Syafiq Nabil Assirhindi / Evice Labs. All rights reserved.
+
+The Licensor hereby grants you the right to copy, modify, create derivative works, redistribute, and make non-production use of the Licensed Work. The Licensed Work may not be used for any production purpose or commercial competitive purpose without a separate commercial license from the Licensor.
+
+Parameters:
+
+Licensor: Syafiq Nabil Assirhindi / Evice Labs
+Licensed Work: Evice-Intent-Ecosystem (and all its sub-crates including engine, sequencer-node, zk-core, l1-contracts)
+Change Date: February 20, 2030
+Change License: GNU General Public License v3.0 (GPL-3.0)
+
+---
+
+Terms and conditions:
+
+1. Grant of License
+The Licensor grants you the right to copy, modify, create derivative works, redistribute, and make non-production use of the Licensed Work. 
+
+2. Limitation on Commercial/Production Use
+You may not use the Licensed Work for any commercial, production, or competitive purpose that generates revenue or competes with the Licensor's ecosystem. Any such use requires a separate, explicit commercial license from the Licensor prior to the Change Date.
+
+3. Change Date and Change License
+On the Change Date specified above, this Business Source License will automatically expire, and the Licensed Work will automatically become licensed under the Change License specified above.
+
+4. Disclaimer of Warranty
+THE LICENSED WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE LICENSOR BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE LICENSED WORK OR THE USE OR OTHER DEALINGS IN THE LICENSED WORK.
