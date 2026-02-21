@@ -10,6 +10,7 @@ pub struct BundleTx {
     pub value: U256,
     pub data: Bytes,
     pub gas_limit: u64,
+    pub nonce: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
