@@ -23,10 +23,7 @@ use trie_db::{
 use crate::serde_helpers;
 use crate::EviceTrieLayout;
 use crate::{
-    consensus::QuorumCertificate,
     crypto::{public_key_to_address, ADDRESS_SIZE, PUBLIC_KEY_SIZE},
-    genesis::Genesis,
-    governance::{ProposalId, ProposalState},
     Address, FullPublicKey,
 };
 
@@ -143,22 +140,6 @@ impl AsHashDB<KeccakHasher, DBValue> for ParityDbTrieBackend {
     }
 }
 
-pub type VrfPublicKeyBytes = [u8; 32];
-pub const MINIMUM_STAKE: u64 = 10_000;
-// pub const TREASURY_ADDRESS: Address = Address([0u8; ADDRESS_SIZE]);
-pub const PROPOSAL_VOTING_PERIOD: u64 = 10;
-pub const L2_BRIDGE_ADDRESS: Address = Address([1u8; ADDRESS_SIZE]);
-pub const DEVELOPER_COMMITTEE: &[&str] = &[
-    "0x2a282495b86386619f57297e5509a25b2ea4a56a",
-    "0x9f535805298f87c897f4c42d3221430262183c51",
-    "0xbf7a05a8d7a1811e23339f40b2a884358a9d13e3",
-];
-pub const DATA_AVAILABILITY_COMMITTEE: &[&str] = &[
-    "0x2a282495b86386619f57297e5509a25b2ea4a56a",
-    "0x9f535805298f87c897f4c42d3221430262183c51",
-    "0xbf7a05a8d7a1811e23339f40b2a884358a9d13e3",
-];
-
 pub type ColumnId = u8;
 pub const COL_TRIE: ColumnId = 0;
 pub const COL_METADATA: ColumnId = 1;
@@ -173,10 +154,6 @@ pub const COL_NETWORK_IDENTITIES: ColumnId = 9;
 pub const COL_TX_LOOKUP: ColumnId = 10;
 
 pub const STATE_ROOT_KEY: &[u8] = b"current_state_root";
-pub const VALIDATORS_KEY: &[u8] = b"validators_set";
-pub const VALIDATOR_LAST_SEEN_KEY: &[u8] = b"validator_last_seen";
-pub const JAILED_VALIDATORS_KEY: &[u8] = b"jailed_validators";
-pub const NEXT_PROPOSAL_ID_KEY: &[u8] = b"next_proposal_id";
 pub const L2_STATE_ROOT_KEY: &[u8] = b"l2_state_root";
 pub const ACTIVE_SEQUENCERS_KEY: &[u8] = b"active_sequencers_set";
 pub const PENDING_UPGRADE_KEY: &[u8] = b"pending_runtime_upgrade";
@@ -185,37 +162,20 @@ pub const L2_LAST_BATCH_L1_BLOCK_KEY: &[u8] = b"l2_last_batch_l1_block";
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, Encode, Decode)]
 pub struct Account {
     pub balance: u64,
-    pub staked_amount: u64,
     pub nonce: u64,
-    pub signing_public_key: FullPublicKey,
-    #[serde(with = "serde_bytes")]
-    pub vrf_public_key: VrfPublicKeyBytes,
-    #[serde(with = "serde_helpers::option_vec_u8")]
-    pub bls_public_key: Option<Vec<u8>>,
-    #[serde(with = "serde_helpers::option_vec_u8")]
-    pub network_identity: Option<Vec<u8>>,
-    pub network_identity_version: u64,
     #[serde(with = "serde_helpers::option_vec_u8")]
     pub code_hash: Option<Vec<u8>>,
     #[serde(with = "serde_helpers::option_vec_u8")]
     pub storage_root: Option<Vec<u8>>,
-    pub last_seen_block: u64,
 }
 
 impl Account {
     pub fn new(balance: u64) -> Self {
         Self {
             balance,
-            staked_amount: 0,
             nonce: 0,
-            signing_public_key: Default::default(),
-            vrf_public_key: [0u8; 32],
-            bls_public_key: None,
-            network_identity: None,
-            network_identity_version: 0,
             code_hash: None,
             storage_root: None,
-            last_seen_block: 0,
         }
     }
 }
@@ -267,9 +227,6 @@ pub type TrieRoot = <KeccakHasher as Hasher>::Out;
 pub struct StateMachine {
     pub db: Arc<Db>,
     pub state_root: TrieRoot,
-    pub validators: HashSet<Address>,
-    pub validator_last_seen: HashMap<Address, u64>,
-    pub jailed_validators: HashSet<Address>,
     pub active_sequencers: HashSet<Address>,
     pub l2_state_root: Vec<u8>,
     pub l2_state_root_history: VecDeque<Vec<u8>>,
@@ -281,9 +238,6 @@ impl Clone for StateMachine {
         Self {
             db: Arc::clone(&self.db),
             state_root: self.state_root,
-            validators: self.validators.clone(),
-            validator_last_seen: self.validator_last_seen.clone(),
-            jailed_validators: self.jailed_validators.clone(),
             active_sequencers: self.active_sequencers.clone(),
             l2_state_root: self.l2_state_root.clone(),
             l2_state_root_history: self.l2_state_root_history.clone(),
@@ -360,9 +314,6 @@ impl StateMachine {
         let mut machine = Self {
             db: Arc::clone(&db),
             state_root: Default::default(),
-            validators: HashSet::new(),
-            validator_last_seen: HashMap::new(),
-            jailed_validators: HashSet::new(),
             active_sequencers: HashSet::new(),
             l2_state_root: vec![0; 32],
             l2_state_root_history: VecDeque::with_capacity(256),
@@ -398,33 +349,6 @@ impl StateMachine {
             }
 
             let config = bincode::config::standard();
-            machine.validators = db
-                .get(COL_METADATA, VALIDATORS_KEY)?
-                .map(|enc| {
-                    bincode::decode_from_slice(&enc, config)
-                        .map(|(v, _)| v)
-                        .unwrap_or_default()
-                })
-                .unwrap_or_default();
-
-            machine.validator_last_seen = db
-                .get(COL_METADATA, VALIDATOR_LAST_SEEN_KEY)?
-                .map(|enc| {
-                    bincode::decode_from_slice(&enc, config)
-                        .map(|(v, _)| v)
-                        .unwrap_or_default()
-                })
-                .unwrap_or_default();
-
-            machine.jailed_validators = db
-                .get(COL_METADATA, JAILED_VALIDATORS_KEY)?
-                .map(|enc| {
-                    bincode::decode_from_slice(&enc, config)
-                        .map(|(v, _)| v)
-                        .unwrap_or_default()
-                })
-                .unwrap_or_default();
-
             machine.active_sequencers = db
                 .get(COL_METADATA, ACTIVE_SEQUENCERS_KEY)?
                 .map(|enc| {
@@ -607,160 +531,9 @@ impl StateMachine {
         }
     }
 
-    pub fn get_proposal(&self, id: ProposalId) -> Result<Option<ProposalState>, StateError> {
-        match self.db.get(COL_GOVERNANCE, &id.to_be_bytes())? {
-            Some(encoded) => Ok(Some(
-                bincode::decode_from_slice(&encoded, bincode::config::standard())
-                    .map(|(p, _)| p)?,
-            )),
-            None => Ok(None),
-        }
-    }
-
-    pub fn set_proposal_in_tx(
-        &self,
-        ops: &mut Vec<(ColumnId, Vec<u8>, Option<Vec<u8>>)>,
-        state: &ProposalState,
-    ) -> Result<(), StateError> {
-        let encoded = bincode::encode_to_vec(state, bincode::config::standard())?; 
-        ops.push((
-            COL_GOVERNANCE,
-            state.id.to_be_bytes().to_vec(),
-            Some(encoded),
-        ));
-        Ok(())
-    }
-
-    pub fn get_all_proposals(&self) -> Result<Vec<ProposalState>, StateError> {
-        let mut proposals = Vec::new();
-        let mut iter = self.db.iter(COL_GOVERNANCE)?;
-
-        while let Ok(Some((key, value))) = iter.next() {
-            if key.as_slice() == NEXT_PROPOSAL_ID_KEY {
-                continue;
-            }
-            let proposal_state: ProposalState =
-                bincode::decode_from_slice(&value[..], bincode::config::standard())
-                    .map(|(p, _)| p)?;
-            proposals.push(proposal_state);
-        }
-
-        Ok(proposals)
-    }
-
     pub fn create_trie_session(&self, root: TrieRoot, col: ColumnId) -> TrieSession {
         TrieSession::new(Arc::clone(&self.db), root, col)
     }
-
-    pub fn process_finished_proposals(
-        &self,
-        current_block_height: u64,
-        ops: &mut Vec<(ColumnId, Vec<u8>, Option<Vec<u8>>)>,
-        session: &mut TrieSession,
-    ) -> Result<(), StateError> {
-        let proposals_to_check = self.get_all_proposals()?;
-
-        for mut proposal_state in proposals_to_check {
-            if !proposal_state.executed && current_block_height > proposal_state.end_block {
-                info!(
-                    "Memproses proposal #{} yang telah selesai.",
-                    proposal_state.id
-                );
-                self.tally_and_execute_proposal(&mut proposal_state, ops, session)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn tally_and_execute_proposal(
-        &self,
-        proposal_state: &mut ProposalState,
-        ops: &mut Vec<(ColumnId, Vec<u8>, Option<Vec<u8>>)>,
-        _session: &mut TrieSession,
-    ) -> Result<(), StateError> {
-        proposal_state.executed = true;
-
-        if proposal_state.yes_votes > proposal_state.no_votes {
-            info!(
-                "Proposal #{} disetujui. Mengeksekusi tindakan...",
-                proposal_state.id
-            );
-
-            match &proposal_state.proposal.action {
-                // ProposalAction::FundTransfer { recipient, amount } => {
-                //     let mut treasury_account: Account = session.get_account(&TREASURY_ADDRESS)?
-                //         .unwrap_or_default();
-
-                //     if treasury_account.balance >= *amount {
-                //         treasury_account.balance -= *amount;
-                //         let mut recipient_account: Account = session.get_account(recipient)?
-                //             .unwrap_or_default();
-                //         recipient_account.balance += *amount;
-
-                //         session.set_account(&TREASURY_ADDRESS, &treasury_account)?;
-                //         session.set_account(recipient, &recipient_account)?;
-
-                //         info!("Berhasil mentransfer {} dari kas ke alamat {}", amount, hex::encode(recipient.as_ref()));
-                //     } else {
-                //         warn!("Eksekusi proposal #{} gagal: dana kas tidak mencukupi.", proposal_state.id);
-                //     }
-                // }
-                _ => {}
-            }
-        } else {
-            info!("Proposal #{} ditolak.", proposal_state.id);
-        }
-
-        self.set_proposal_in_tx(ops, proposal_state)?;
-        Ok(())
-    }
-
-    // pub fn apply_transaction(
-    //     &self,
-    //     tx: &Transaction,
-    //     mut sender_account: Account,
-    // ) -> Result<Account, BlockchainError> {
-    //     if tx.nonce != sender_account.nonce {
-    //         return Err(BlockchainError::StaleNonce { expected: sender_account.nonce, got: tx.nonce });
-    //     }
-
-    //     sender_account.nonce += 1;
-
-    //     match &tx.data {
-    //         TransactionData::Transfer { amount, .. } => {
-    //             if sender_account.balance < *amount {
-    //                 return Err(BlockchainError::InsufficientBalance { has: sender_account.balance, needs: *amount });
-    //             }
-    //             sender_account.balance -= *amount;
-    //         }
-    //         TransactionData::Stake { amount } => {
-    //             if sender_account.balance < *amount {
-    //                 return Err(BlockchainError::InsufficientBalance { has: sender_account.balance, needs: *amount });
-    //             }
-    //             sender_account.balance -= *amount;
-    //             sender_account.staked_amount += *amount;
-    //         }
-    //         TransactionData::SubmitProposal { .. } => {
-    //             if !self.validators.contains(&tx.sender) {
-    //                 return Err(BlockchainError::TransactionInvalid("Hanya validator yang dapat mengajukan proposal.".into()));
-    //             }
-    //         }
-    //         TransactionData::DepositToL2 { amount } => {
-    //             if sender_account.balance < *amount {
-    //                 return Err(BlockchainError::InsufficientBalance { has: sender_account.balance, needs: *amount });
-    //             }
-    //             sender_account.balance -= *amount;
-    //         }
-    //         TransactionData::WithdrawFromL2 { withdrawal_proof, .. } => {
-    //             if withdrawal_proof.l2_state_root.is_empty() {
-    //                 return Err(BlockchainError::TransactionInvalid("Bukti penarikan L2 tidak valid".into()));
-    //             }
-    //         }
-    //         _ => {}
-    //     }
-
-    //     Ok(sender_account)
-    // }
 
     pub fn initialize_from_genesis(
         &mut self,
@@ -800,44 +573,16 @@ impl StateMachine {
 
                 let account = Account {
                     balance: genesis_account.balance.parse()?,
-                    staked_amount: genesis_account.staked_amount.parse()?,
                     nonce: 0,
-                    signing_public_key: FullPublicKey(
-                        pub_key_bytes
-                            .clone()
-                            .try_into()
-                            .expect("Panjang kunci publik sudah divalidasi"),
-                    ),
-                    vrf_public_key: genesis_account
-                        .vrf_public_key
-                        .as_ref()
-                        .map(|k| hex::decode(k).unwrap().try_into().unwrap())
-                        .unwrap_or_default(),
-                    bls_public_key: genesis_account
-                        .bls_public_key
-                        .as_ref()
-                        .map(|k| hex::decode(k).unwrap()),
-                    network_identity: genesis_account
-                        .network_identity
-                        .as_ref()
-                        .and_then(|s| s.parse::<Multiaddr>().ok())
-                        .map(|ma| ma.to_vec()),
-                    network_identity_version: 0,
                     code_hash: None,
                     storage_root: None,
-                    last_seen_block: 0,
                 };
-
-                if account.staked_amount > 0 {
-                    self.validators.insert(derived_address);
-                }
 
                 let account_data = bincode::encode_to_vec(&account, bincode::config::standard())?;
                 let hashed_key = hash_key(&derived_address);
                 trie.insert(hashed_key.as_ref(), &account_data)?;
             }
 
-            self.validators = self.validators.clone();
             self.state_root = *trie.root();
         }
 
@@ -863,23 +608,12 @@ impl StateMachine {
             round: 0,
             view_number: 0,
             justify: QuorumCertificate::genesis_qc(),
-            vrf_output: vec![],
-            vrf_proof: vec![],
         };
         db_ops.push((
             COL_BLOCKS,
             0u64.to_be_bytes().to_vec(),
             Some(bincode::encode_to_vec(
                 &genesis_block,
-                bincode::config::standard(),
-            )?),
-        ));
-
-        db_ops.push((
-            COL_METADATA,
-            VALIDATORS_KEY.to_vec(),
-            Some(bincode::encode_to_vec(
-                &self.validators,
                 bincode::config::standard(),
             )?),
         ));
@@ -1051,7 +785,6 @@ mod tests {
             .expect("Bootstrap should succeed");
 
         assert_ne!(state.state_root, Default::default());
-        assert_eq!(state.validators.len(), 3);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-// aegis-node/src/crypto.rs
+// sequencer-node/src/crypto.rs
 
 use blst::min_pk::{
     AggregateSignature, PublicKey as BlsPublicKey, SecretKey as BlsSecretKey,
@@ -27,9 +27,6 @@ pub const PUBLIC_KEY_SIZE: usize = 1312;
 pub const ADDRESS_SIZE: usize = 20;
 pub const PRIVATE_KEY_SIZE: usize = 2560;
 pub const SIGNATURE_SIZE: usize = 2420;
-pub const BLS_PUBLIC_KEY_SIZE: usize = 48;
-pub const BLS_SECRET_KEY_SIZE: usize = 32;
-pub const BLS_SIGNATURE_SIZE: usize = 96;
 
 pub fn public_key_to_address(public_key: &[u8; PUBLIC_KEY_SIZE]) -> Address {
     let hash = KeccakHasher::hash(public_key);
@@ -118,97 +115,4 @@ pub fn verify(public_key: &FullPublicKey, message: &[u8], signature_bytes: &[u8]
     };
 
     verify_detached_signature(&sig, message, &pk).is_ok()
-}
-
-#[derive(Clone)]
-pub struct DkgState {
-    pub participants: HashMap<Address, BlsPublicKey>,
-    pub threshold: usize,
-}
-
-pub fn verify_finality_certificate(dkg_state: &DkgState, cert: &FinalityCertificate) -> bool {
-    if cert.aggregated_signature.is_empty() {
-        return cert.epoch == 0;
-    }
-    let Ok(sig) = BlsSignature::from_bytes(&cert.aggregated_signature) else {
-        return false;
-    };
-
-    let mut pk_refs: Vec<&BlsPublicKey> = Vec::new();
-    for voter_addr in &cert.voters {
-        if let Some(pk) = dkg_state.participants.get(voter_addr) {
-            pk_refs.push(pk);
-        } else {
-            warn!("[VERIFY CERT] Voter 0x{} dari sertifikat tidak ditemukan di DKG state.", hex::encode(voter_addr.as_ref()));
-            return false;
-        }
-    }
-
-    if pk_refs.len() < dkg_state.threshold {
-        return false;
-    }
-
-    let result = sig.fast_aggregate_verify(
-        true,
-        cert.checkpoint_hash.as_slice(),
-        b"aegis_finality_vote",
-        &pk_refs,
-    );
-    result == blst::BLST_ERROR::BLST_SUCCESS
-}
-
-pub fn aggregate_finality_votes(
-    votes: &[FinalityVote],
-    threshold: usize,
-) -> Option<FinalityCertificate> {
-    if votes.len() < threshold {
-        return None;
-    }
-
-    let first_vote = &votes[0];
-    let epoch = first_vote.epoch;
-    let checkpoint_hash = &first_vote.checkpoint_hash;
-
-    if !votes
-        .iter()
-        .all(|v| v.epoch == epoch && v.checkpoint_hash == *checkpoint_hash)
-    {
-        log::error!("[AGGREGATE] Ditemukan suara finalitas dari epoch/hash yang berbeda. Agregasi dibatalkan.");
-        return None;
-    }
-
-    let mut unique_votes = std::collections::HashMap::new();
-    for vote in votes {
-        if let Ok(sig) = BlsSignature::from_bytes(&vote.signature_share) {
-            unique_votes.insert(vote.voter_address, sig);
-        }
-    }
-
-    if unique_votes.len() < threshold {
-        return None;
-    }
-
-    let mut sorted_voters: Vec<Address> = unique_votes.keys().cloned().collect();
-    sorted_voters.sort();
-
-    let sig_refs: Vec<&BlsSignature> = sorted_voters
-        .iter()
-        .map(|addr| unique_votes.get(addr).unwrap())
-        .collect();
-
-    match AggregateSignature::aggregate(&sig_refs, true) {
-        Ok(aggregate_sig) => Some(FinalityCertificate {
-            checkpoint_hash: checkpoint_hash.clone(),
-            epoch,
-            aggregated_signature: aggregate_sig.to_signature().to_bytes().to_vec(),
-            voters: sorted_voters,
-        }),
-        Err(e) => {
-            log::error!(
-                "[AGGREGATE] Kegagalan saat mengagregasi tanda tangan BLS: {:?}",
-                e
-            );
-            None
-        }
-    }
 }

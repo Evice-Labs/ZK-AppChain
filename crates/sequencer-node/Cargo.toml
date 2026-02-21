@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 common = { workspace = true }
 engine = { workspace = true }
-aegis-node = { workspace = true }
+zk-prover = { workspace = true }
 
 prost = { workspace = true }
 tonic = { workspace = true }
