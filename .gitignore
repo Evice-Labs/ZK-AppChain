@@ -1,5 +1,7 @@
 /target
-/solver-service
+
+crates/solver-service/
+
 *.lock
 *.wal
 
