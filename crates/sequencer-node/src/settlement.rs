@@ -1,7 +1,7 @@
 // crates/sequencer-node/src/settlement.rs
 
-use aegis_node::rpc_client::RpcClient;
-use aegis_node::Transaction; 
+use sequencer_node::rpc_client::RpcClient;
+use sequencer_node::Transaction; 
 use tracing::{info, error, warn};
 use std::sync::Arc;
 use tokio::sync::Mutex;

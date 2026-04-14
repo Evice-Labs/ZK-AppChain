@@ -1,4 +1,4 @@
-// sequencer-node/src/crypto.rs
+// crates/sequencer-node/src/crypto.rs
 
 use blst::min_pk::{
     AggregateSignature, PublicKey as BlsPublicKey, SecretKey as BlsSecretKey,

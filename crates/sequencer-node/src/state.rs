@@ -1,4 +1,4 @@
-// aegis-node/src/state.rs
+// crates/sequencer-node/src/state.rs
 
 use bincode::{Decode, Encode};
 use libp2p::Multiaddr;
