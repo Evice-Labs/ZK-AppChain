@@ -14,7 +14,72 @@ service TradingEngine {
   // 3. Get Orderbook Depth 
   // Mengambil state pasar saat ini (Top N Bids/Asks)
   rpc GetOrderBookDepth (DepthRequest) returns (DepthResponse);
-  rpc ExecuteSolverBundle(IntentBundle) returns (ExecutionReport);
+
+  // 4. Mempool Listener (Server-Side Streaming)
+  // Solver memanggil RPC ini sekali, lalu Sequencer akan terus mengirimkan aliran (stream) intent baru.
+  rpc SubscribeIntentMempool (MempoolSubscribeRequest) returns (stream IntentEvent);
+
+  // 5. Order Flow Auction (OFA) Bidding
+  // Solver mengirimkan tawaran (Bid) alih-alih langsung mengeksekusi.
+  rpc SubmitIntentBid (IntentBidRequest) returns (IntentBidResponse);
+
+  // 6. Execute Solver Bundle (Dibutuhkan oleh mock_sequencer.rs)
+  rpc ExecuteSolverBundle (IntentBundle) returns (ExecutionReport);
+}
+
+// =============================================================
+// Data Structures: Event-Driven & Intent Standard
+// =============================================================
+
+// Request dari Solver untuk mendengarkan Mempool
+message MempoolSubscribeRequest {
+  string solver_id = 1;
+  // Opsional: Solver bisa memfilter intent di chain tertentu (misal khusus Optimism/Unichain)
+  repeated uint32 interested_chain_ids = 2; 
+}
+
+// Event yang disiarkan Sequencer ke seluruh Solver
+message IntentEvent {
+  string event_id = 1;
+  uint64 timestamp = 2;
+  // Membawa detail intent standar
+  CrossChainIntent intent = 3;
+}
+
+// Representasi Standar ERC-7683 (Cross-Chain Intent)
+// Menggantikan InternalOrder/PlaceOrderRequest yang terlalu sederhana
+message CrossChainIntent {
+  string intent_id = 1;            // Hash unik dari intent
+  string user_address = 2;         // Alamat EVM pengguna (0x...)
+  
+  uint32 source_chain_id = 3;      // Chain asal pengguna
+  uint32 destination_chain_id = 4; // Chain tujuan penyelesaian (misal: L1 AppChain Anda)
+  
+  string input_token = 5;          // Alamat ERC20 token yang diberikan user
+  uint64 input_amount = 6;         // Jumlah yang dikunci user
+  string output_token = 7;         // Alamat ERC20 token yang diinginkan user
+  uint64 min_output_amount = 8;    // Batas toleransi harga (Slippage protection)
+  
+  uint64 deadline = 9;             // Unix timestamp, jika lewat maka intent kadaluarsa
+  bytes user_signature = 10;       // Tanda tangan kriptografis (EIP-712) untuk divalidasi oleh ZK-Prover
+}
+
+// Tawaran (Bid) dari Solver untuk menyelesaikan sebuah Intent
+message IntentBidRequest {
+  string solver_id = 1;
+  string intent_id = 2;            // Merujuk ke intent mana yang ingin diselesaikan
+  
+  // Rute dan estimasi eksekusi dari Solver
+  uint64 proposed_output_amount = 3; // Berapa yang berani diberikan Solver ke User? (Harus >= min_output_amount)
+  uint64 estimated_gas_cost = 4;     // Estimasi gas untuk kalkulasi net profit di Sequencer
+  
+  bytes solver_signature = 5;      // Komitmen kriptografis solver
+}
+
+message IntentBidResponse {
+  bool accepted = 1;               // Apakah bid masuk ke sistem lelang? (Belum tentu menang)
+  string message = 2;
+  string auction_id = 3;           // ID lelang untuk dilacak
 }
 
 // =============================================================
