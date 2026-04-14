@@ -24,12 +24,13 @@ common = { path = "crates/common" }
 engine = { path = "crates/engine" }
 simulator = { path = "crates/simulator" }
 sequencer = { path = "crates/sequencer-node" }
-aegis-node = { path = "crates/aegis-node" }
-aegis-core = { path = "crates/aegis-core" }
+zk-prover = { path = "crates/zk-prover" }
+zk-core = { path = "crates/zk-core" }
 
 # --- EXTERNAL LIBRARIES ---
 # Concurrency & Runtime
 tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1.13"
 rayon = "1.8"
 crossbeam = "0.8"
 parking_lot = "0.12"
@@ -86,6 +87,7 @@ actix-web = "4.11.0"
 actix-web-ratelimit = "0.1.1"
 tiny_http = "0.12.0"
 async-recursion = "1.1.1"
+async-trait = "0.1"
 
 # --- Kriptografi & Keamanan ---
 sha2 = "0.10.8"
