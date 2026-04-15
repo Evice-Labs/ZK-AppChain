@@ -1,4 +1,4 @@
-// crates/api-server/src/main.rs
+// crates/sequencer-node/src/main.rs
 
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
@@ -9,16 +9,16 @@ use axum::{
 };
 use engine::processor::{Command, MarketProcessor};
 use engine::{EngineEvent, Side as EngineSide};
+use settlement::SettlementEngine;
 use std::net::SocketAddr;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tonic::{transport::Server, Request, Response, Status};
 use trading::trading_engine_server::{TradingEngine, TradingEngineServer};
 use trading::{
     CancelOrderRequest, CancelOrderResponse, DepthRequest, DepthResponse, ExecutionReport,
-    IntentBundle, OrderLevel as ProtoOrderLevel, PlaceOrderRequest, PlaceOrderResponse,
-    Side as ProtoSide, TradeExecution,
+    IntentBidRequest, IntentBidResponse, IntentBundle, OrderLevel as ProtoOrderLevel,
+    PlaceOrderRequest, PlaceOrderResponse, Side as ProtoSide, TradeExecution,
 };
-use settlement::SettlementEngine;
 
 mod settlement;
 
@@ -235,7 +235,7 @@ impl TradingEngine for TradingService {
             .await
             .map_err(|_| Status::internal("Engine down"))?;
 
-        // Tunggu hasil 
+        // Tunggu hasil
         let (asks, bids) = resp_rx.await.map_err(|_| Status::internal("No response"))?;
 
         // Mapping dari Engine struct ke Proto struct
@@ -259,6 +259,41 @@ impl TradingEngine for TradingService {
             bids: proto_bids,
             asks: proto_asks,
             sequence_id: 0,
+        }))
+    }
+
+    async fn submit_intent_bid(
+        &self,
+        request: Request<IntentBidRequest>,
+    ) -> Result<Response<IntentBidResponse>, Status> {
+        let req = request.into_inner();
+
+        // 1. Validasi Bid (Tanda tangan, format)
+        if req.solver_signature.is_empty() {
+            return Err(Status::invalid_argument("Signature required"));
+        }
+
+        // 2. Siapkan channel untuk respon lelang
+        let (resp_tx, resp_rx) = oneshot::channel();
+
+        // 3. Kirim Bid ke Engine/Processor yang baru (Kita akan modifikasi ini)
+        self.processor_sender
+            .send(Command::SubmitBid {
+                solver_id: req.solver_id,
+                intent_id: req.intent_id,
+                proposed_output_amount: req.proposed_output_amount,
+                estimated_gas_cost: req.estimated_gas_cost,
+                solver_signature: req.solver_signature,
+                responder: resp_tx,
+            })
+            .await
+            .map_err(|_| Status::internal("Engine is down"))?;
+
+        // 4. Berikan respons instan bahwa Bid diterima dalam kolam lelang
+        Ok(Response::new(IntentBidResponse {
+            accepted: true,
+            message: "Bid queued for OFA evaluation".to_string(),
+            auction_id: format!("auc-{}", req.intent_id), // ID lelang berdasarkan ID Intent
         }))
     }
 }
@@ -312,7 +347,7 @@ async fn handle_socket(mut socket: WebSocket, broadcast_tx: broadcast::Sender<En
         // Kirim string JSON ke Client WebSocket
         if let Ok(msg_text) = serde_json::to_string(&json_msg) {
             if socket.send(Message::Text(msg_text)).await.is_err() {
-                break; 
+                break;
             }
         }
     }
@@ -330,7 +365,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. Spawn Market Processor (The Engine) di background thread
     let processor_broadcast_tx = broadcast_tx.clone();
-    let processor = MarketProcessor::new(rx, processor_broadcast_tx);
+    let mut processor = MarketProcessor::new(rx, processor_broadcast_tx);
     tokio::spawn(async move {
         processor.run().await;
     });
