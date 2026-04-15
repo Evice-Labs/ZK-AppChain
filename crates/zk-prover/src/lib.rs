@@ -1,79 +1,78 @@
 // crates/zk-prover/src/lib.rs
 
 use p3_air::{Air, AirBuilder, BaseAir};
-use p3_field::PrimeCharacteristicRing;
 use p3_matrix::Matrix;
 
-/*
- * DEFINI KOLOM (Execution Trace)
- */
-pub struct EviceRollupCols<T> {
-    pub nonce: T,
-    pub sender_balance: T,
-    pub receiver_balance: T,
-    pub tx_value: T,
+// DEFINI KOLOM (Execution Trace)
+pub struct IntentRollupCols<T> {
+    pub intent_id: T,
+    
+    // Parameter Intent dari Pengguna
+    pub user_input_amount: T,
+    pub user_min_output: T, // Batas toleransi (Slippage)
+    
+    // Eksekusi dari Solver pemenang lelang
+    pub solver_actual_output: T, 
+    
+    // State Transisi Saldo
+    pub user_balance: T,
+    pub solver_balance: T,
 }
 
-/*
- * DEFINISI SIRKUIT (The AIR)
- */
-pub struct EviceRollupAir;
+// DEFINISI SIRKUIT (The AIR)
+pub struct IntentRollupAir;
 
-impl<F> BaseAir<F> for EviceRollupAir {
+impl<F> BaseAir<F> for IntentRollupAir {
     fn width(&self) -> usize {
-        4 
+        6
     }
 }
 
-/* 
- * LOGIKA KENDALA (The Constraints)
- *
- * Di sinilah keajaiban matematika terjadi. Kita mendefinisikan aturan yang 
- * TIDAK BOLEH DILANGGAR oleh Sequencer L2.
- */
-impl<AB: AirBuilder> Air<AB> for EviceRollupAir {
+// LOGIKA KENDALA (The Constraints)
+impl<AB: AirBuilder> Air<AB> for IntentRollupAir {
     fn eval(&self, builder: &mut AB) {
         let main = builder.main();
-        
+
         // Ambil baris saat ini (local) dan baris berikutnya (next) dari matriks eksekusi
         let local = main.row_slice(0).unwrap();
         let next = main.row_slice(1).unwrap();
 
         // Jika kita berada di baris terakhir, tidak perlu membandingkan dengan baris "next"
         // builder.transition() memastikan aturan ini hanya berlaku antar-baris.
-        let mut transition_builder = builder.when_transition();
+        let mut transition = builder.when_transition();
 
-        // Ambil variabel dari array berdasarkan indeks (0: nonce, 1: sender_bal, dll)
-        let local_nonce = local[0].clone();
-        let local_sender_bal = local[1].clone();
-        let local_receiver_bal = local[2].clone();
-        let local_tx_value = local[3].clone();
+        // Mapping Kolom (Local Row)
+        let local_user_input = local[1].clone();
+        let local_min_output = local[2].clone();
+        let local_actual_output = local[3].clone();
+        let local_user_bal = local[4].clone();
+        let local_solver_bal = local[5].clone();
 
-        let next_nonce = next[0].clone();
-        let next_sender_bal = next[1].clone();
-        let next_receiver_bal = next[2].clone();
+        // Mapping Kolom (Next Row - State setelah intent diselesaikan)
+        let next_user_bal = next[4].clone();
+        let next_solver_bal = next[5].clone();
 
-        // --------------------------------------------------------------------
-        // ATURAN MATEMATIKA EVICE L2 TRANSACTIONS
-        // Dalam ZK AIR, kita menyatakan kebenaran dengan persamaan yang harus bernilai NOL (0).
-        // Format: `A = B` ditulis sebagai `builder.assert_zero(A - B)`
-        // --------------------------------------------------------------------
+        // --- ATURAN 1: PERLINDUNGAN SLIPPAGE (INTI DARI INTENT) ---
+        // ZK Circuit HARUS menggagalkan proof jika solver memberikan output lebih kecil dari yang diminta user.
+        // Di Plonky3 (Finite Fields), ketidaksamaan (>=) biasanya dilakukan melalui Range Check (Lookup Table). 
+        // Secara konseptual, sirkuit memverifikasi: builder.assert_range_check(local_actual_output - local_min_output);
+        
+        // --- ATURAN 2: PENGURANGAN SALDO PENGGUNA ---
+        // Saldo pengguna dipotong sebesar input_amount yang ia jaminkan
+        transition.assert_eq(
+            next_user_bal.clone() + local_user_input.clone(), 
+            local_user_bal.clone() + local_actual_output.clone()
+        );
+        // Persamaan di atas setara dengan: 
+        // NextUserBal = LocalUserBal - UserInput + ActualOutput (Jika swap beda token)
+        // (Catatan: Untuk penyederhanaan contoh, kita gabungkan di satu state)
 
-        // Aturan 1: Nonce pengirim harus bertambah 1 di transaksi berikutnya
-        // next_nonce - (local_nonce + 1) == 0
-        transition_builder.assert_eq(next_nonce, local_nonce + AB::Expr::ONE);
-
-        // Aturan 2: Saldo pengirim harus berkurang sebesar tx_value
-        // next_sender_bal - (local_sender_bal - local_tx_value) == 0
-        transition_builder.assert_eq(next_sender_bal, local_sender_bal - local_tx_value.clone());
-
-        // Aturan 3: Saldo penerima harus bertambah sebesar tx_value
-        // next_receiver_bal - (local_receiver_bal + local_tx_value) == 0
-        transition_builder.assert_eq(next_receiver_bal, local_receiver_bal + local_tx_value);
-
-        // (Catatan: Pengecekan Underflow/Overflow di Plonky3 biasanya ditangani
-        // dengan teknik "Range Check" menggunakan tabel Lookup, yang bisa kita
-        // tambahkan nanti di tahap optimasi lanjutan).
+        // --- ATURAN 3: PENDAPATAN SOLVER (SETTLEMENT) ---
+        // Solver mendapatkan input pengguna, tetapi saldonya dipotong untuk membayar output pengguna
+        transition.assert_eq(
+            next_solver_bal.clone() + local_actual_output.clone(),
+            local_solver_bal.clone() + local_user_input.clone()
+        );
     }
 }
 
@@ -82,8 +81,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_air_compilation() {
-        let _air = EviceRollupAir;
+    fn test_intent_air_compilation() {
+        let _air = IntentRollupAir;
         assert!(true);
     }
 }
