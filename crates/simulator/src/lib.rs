@@ -167,12 +167,12 @@ impl EvmSimulator {
                     gas_used, output, ..
                 } => {
                     total_gas += gas_used;
-                    println!("✅ TX #{} SUCCESS. Gas: {}", i, gas_used);
+                    println!("TX #{} SUCCESS. Gas: {}", i, gas_used);
 
                     // TANGKAP ALAMAT KONTRAK
                     if let Output::Create(bytes, addr) = output {
                         if let Some(a) = addr {
-                            println!("   DEPLOYMENT DETECTED! Created Address: {:?}", a);
+                            println!("DEPLOYMENT DETECTED! Created Address: {:?}", a);
                             last_created_address = Some(a);
                             last_created_code = Some(bytes);
                         }
@@ -190,7 +190,7 @@ impl EvmSimulator {
                             if !has_code {
                                 if i > 0 {
                                     println!(
-                                        "   ⚠️  Warning: Memanggil alamat {:?} tanpa kode.",
+                                        "Warning: Memanggil alamat {:?} tanpa kode.",
                                         to_addr
                                     );
                                 }
@@ -200,7 +200,7 @@ impl EvmSimulator {
                 }
                 ExecutionResult::Revert { output, .. } => {
                     let hex_output = hex::encode(&output);
-                    println!("❌ TX #{} REVERTED! Hex: 0x{}", i, hex_output);
+                    println!("TX #{} REVERTED! Hex: 0x{}", i, hex_output);
 
                     if i == 1 {
                         victim_reverted = true;
@@ -208,7 +208,7 @@ impl EvmSimulator {
                     }
                 }
                 ExecutionResult::Halt { reason, .. } => {
-                    println!("🛑 TX #{} HALTED! Reason: {:?}", i, reason);
+                    println!("TX #{} HALTED! Reason: {:?}", i, reason);
                     if i == 1 {
                         victim_reverted = true;
                         revert_reason = Some(format!("Halted: {:?}", reason));
@@ -228,6 +228,43 @@ impl EvmSimulator {
             created_address: last_created_address,
             created_code: last_created_code,
         })
+    }
+
+    // Fungsi untuk membaca state kontrak (view/pure) dan mengembalikan output + estimasi gas
+    pub fn simulate_view_call(
+        &mut self,
+        caller: Address,
+        to: Address,
+        calldata: Bytes,
+    ) -> Result<(Bytes, u64)> {
+        // Buat TxEnv tanpa perlu memikirkan nonce atau value
+        let mut tx = TxEnv::default();
+        tx.caller = caller;
+        tx.kind = TxKind::Call(to);
+        tx.data = calldata;
+        tx.gas_limit = 1_000_000;
+        tx.gas_price = 1; // Harga dummy untuk simulasi view
+        tx.value = U256::ZERO;
+
+        let mut evm = Context::mainnet().with_db(&mut self.db).build_mainnet();
+
+        // Eksekusi murni di RAM
+        let result = evm
+            .transact(tx)
+            .map_err(|e| anyhow::anyhow!("EVM Error: {:?}", e))?;
+
+        match result.result {
+            ExecutionResult::Success {
+                output, gas_used, ..
+            } => match output {
+                Output::Call(bytes) => Ok((bytes, gas_used)),
+                Output::Create(bytes, _) => Ok((bytes, gas_used)),
+            },
+            ExecutionResult::Revert { output, .. } => {
+                Err(anyhow::anyhow!("Revert Hex: 0x{}", hex::encode(&output)))
+            }
+            ExecutionResult::Halt { reason, .. } => Err(anyhow::anyhow!("Halted: {:?}", reason)),
+        }
     }
 }
 
