@@ -1,8 +1,13 @@
 // crates/engine-core/src/processor.rs
 
+use std::collections::{BTreeMap, HashMap};
+use tokio::{
+    sync::{broadcast, mpsc},
+    time::{interval, Duration},
+};
+
 use crate::wal::WalHandler;
 use crate::{EngineEvent, LogEntry, OrderBook, OrderLevel, Side};
-use tokio::sync::{broadcast, mpsc};
 
 #[derive(Debug)]
 pub struct BundleRequest {
@@ -15,6 +20,14 @@ pub struct BundleRequest {
 
 #[derive(Debug)]
 pub enum Command {
+    SubmitBid {
+        solver_id: String,
+        intent_id: String,
+        proposed_output_amount: u64,
+        estimated_gas_cost: u64,
+        solver_signature: Vec<u8>,
+        responder: tokio::sync::oneshot::Sender<Result<String, String>>,
+    },
     PlaceOrder {
         user_id: u64,
         order_id: u64,
@@ -38,10 +51,17 @@ pub enum Command {
     },
 }
 
+#[derive(Debug, Clone)]
+struct Auction {
+    intent_id: String,
+    bids: BTreeMap<u64, String>,
+    end_time: std::time::Instant,
+}
 pub struct MarketProcessor {
     book: OrderBook,
     receiver: mpsc::Receiver<Command>,
     wal: WalHandler,
+    active_auctions: HashMap<String, Auction>,
     pub event_broadcaster: broadcast::Sender<EngineEvent>,
 }
 
@@ -86,127 +106,205 @@ impl MarketProcessor {
             book,
             receiver,
             wal,
+            active_auctions: HashMap::new(),
             event_broadcaster: broadcaster,
         }
     }
 
-    pub async fn run(mut self) {
-        println!("Market Engine Started & Persisted.");
+    pub async fn run(&mut self) {
+        // Timer lelang (misal: setiap lelang berdurasi 500ms)
+        let mut tick = interval(Duration::from_millis(500));
 
-        while let Some(cmd) = self.receiver.recv().await {
-            match cmd {
-                Command::PlaceOrder {
-                    user_id,
-                    order_id,
-                    side,
-                    price,
-                    quantity,
-                    responder,
-                } => {
-                    // 1. (WAL) Persistence First (Write-Ahead)
-                    let log_entry = LogEntry::Place {
-                        order_id,
-                        user_id,
-                        side,
-                        price,
-                        quantity,
-                    };
-
-                    if let Err(e) = self.wal.write_entry(&log_entry) {
-                        eprintln!("CRITICAL: Failed to write to WAL: {}", e);
-                    }
-
-                    // 2. Mmemory Execution
-                    let events = self
-                        .book
-                        .place_limit_order(order_id, user_id, side, price, quantity);
-
-                    // 3. Broadcast (Pub/Sub)
-                    // Kirim copy event ke semua subscriber WebSocket
-                    for event in &events {
-                        // Hanya broadcast event publik (Trade). Private info (OrderPlaced) opsional.
-                        // Di sini broadcast semuanya agar dashboard terlihat hidup
-                        let _ = self.event_broadcaster.send(event.clone());
-                    }
-
-                    // 4. Respond (gRPC)
-                    let _ = responder.send(events);
+        loop {
+            tokio::select! {
+                Some(cmd) = self.receiver.recv() => {
+                    self.handle_command(cmd).await;
                 }
-
-                Command::ExecuteBundle { orders, responder } => {
-                    // 1. Transactional Loop
-                    // Dalam model Single-Threaded Actor ini, atomicity dijamin
-                    // karena tidak ada perintah lain yang bisa menyela loop ini.
-
-                    let mut bundle_events = Vec::new();
-
-                    for req in orders {
-                        // A. Write to WAL (Persistence)
-                        let log_entry = LogEntry::Place {
-                            order_id: req.order_id,
-                            user_id: req.user_id,
-                            side: req.side,
-                            price: req.price,
-                            quantity: req.quantity,
-                        };
-
-                        if let Err(e) = self.wal.write_entry(&log_entry) {
-                            eprintln!("WAL Write Error: {}", e);
-                            // Dalam produksi, bisa break/panic disini
-                        }
-
-                        // B. Execute in Memory
-                        let mut events = self.book.place_limit_order(
-                            req.order_id,
-                            req.user_id,
-                            req.side,
-                            req.price,
-                            req.quantity,
-                        );
-
-                        // C. Collect Events
-                        // Menggabungkan event dari semua order dalam bundle
-                        bundle_events.append(&mut events);
-                    }
-
-                    // 2. Broadcast semua event
-                    for event in &bundle_events {
-                        let _ = self.event_broadcaster.send(event.clone());
-                    }
-
-                    // 3. Return report
-                    let _ = responder.send(bundle_events);
-                }
-
-                Command::CancelOrder {
-                    user_id,
-                    order_id,
-                    responder,
-                } => {
-                    // 1. Persistence First
-                    let log_entry = LogEntry::Cancel { order_id, user_id };
-
-                    if let Err(e) = self.wal.write_entry(&log_entry) {
-                        eprintln!("CRITICAL: Failed to write to WAL: {}", e);
-                    }
-
-                    // 2. Memory Execution
-                    let events = self.book.cancel_order(order_id, user_id);
-
-                    // Broadcast Cancel
-                    for event in &events {
-                        let _ = self.event_broadcaster.send(event.clone());
-                    }
-
-                    let _ = responder.send(events);
-                }
-
-                Command::GetDepth { limit, responder } => {
-                    // Read-only command tidak perlu ditulis ke WAL
-                    let depth = self.book.get_depth(limit);
-                    let _ = responder.send(depth);
+                _ = tick.tick() => {
+                    self.resolve_auctions().await;
                 }
             }
         }
+    }
+
+    async fn handle_command(&mut self, cmd: Command) {
+        match cmd {
+            Command::SubmitBid {
+                solver_id,
+                intent_id,
+                proposed_output_amount,
+                ..
+            } => {
+                // Masukkan bid ke dalam lelang yang aktif
+                if let Some(auction) = self.active_auctions.get_mut(&intent_id) {
+                    auction.bids.insert(proposed_output_amount, solver_id);
+                } else {
+                    // Jika belum ada lelang untuk intent ini, buat baru
+                    let mut new_auction = Auction {
+                        intent_id: intent_id.clone(),
+                        bids: BTreeMap::new(),
+                        end_time: std::time::Instant::now() + Duration::from_millis(500),
+                    };
+                    new_auction.bids.insert(proposed_output_amount, solver_id);
+                    self.active_auctions.insert(intent_id, new_auction);
+                }
+            }
+
+            Command::PlaceOrder {
+                user_id,
+                order_id,
+                side,
+                price,
+                quantity,
+                responder,
+            } => {
+                // 1. (WAL) Persistence First (Write-Ahead)
+                let log_entry = LogEntry::Place {
+                    order_id,
+                    user_id,
+                    side,
+                    price,
+                    quantity,
+                };
+
+                if let Err(e) = self.wal.write_entry(&log_entry) {
+                    eprintln!("CRITICAL: Failed to write to WAL: {}", e);
+                }
+
+                // 2. Mmemory Execution
+                let events = self
+                    .book
+                    .place_limit_order(order_id, user_id, side, price, quantity);
+
+                // 3. Broadcast (Pub/Sub)
+                // Kirim copy event ke semua subscriber WebSocket
+                for event in &events {
+                    // Hanya broadcast event publik (Trade). Private info (OrderPlaced) opsional.
+                    // Di sini broadcast semuanya agar dashboard terlihat hidup
+                    let _ = self.event_broadcaster.send(event.clone());
+                }
+
+                // 4. Respond (gRPC)
+                let _ = responder.send(events);
+            }
+
+            Command::ExecuteBundle { orders, responder } => {
+                // 1. Transactional Loop
+                // Dalam model Single-Threaded Actor ini, atomicity dijamin
+                // karena tidak ada perintah lain yang bisa menyela loop ini.
+
+                let mut bundle_events = Vec::new();
+
+                for req in orders {
+                    // A. Write to WAL (Persistence)
+                    let log_entry = LogEntry::Place {
+                        order_id: req.order_id,
+                        user_id: req.user_id,
+                        side: req.side,
+                        price: req.price,
+                        quantity: req.quantity,
+                    };
+
+                    if let Err(e) = self.wal.write_entry(&log_entry) {
+                        eprintln!("WAL Write Error: {}", e);
+                        // Dalam produksi, bisa break/panic disini
+                    }
+
+                    // B. Execute in Memory
+                    let mut events = self.book.place_limit_order(
+                        req.order_id,
+                        req.user_id,
+                        req.side,
+                        req.price,
+                        req.quantity,
+                    );
+
+                    // C. Collect Events
+                    // Menggabungkan event dari semua order dalam bundle
+                    bundle_events.append(&mut events);
+                }
+
+                // 2. Broadcast semua event
+                for event in &bundle_events {
+                    let _ = self.event_broadcaster.send(event.clone());
+                }
+
+                // 3. Return report
+                let _ = responder.send(bundle_events);
+            }
+
+            Command::CancelOrder {
+                user_id,
+                order_id,
+                responder,
+            } => {
+                // 1. Persistence First
+                let log_entry = LogEntry::Cancel { order_id, user_id };
+
+                if let Err(e) = self.wal.write_entry(&log_entry) {
+                    eprintln!("CRITICAL: Failed to write to WAL: {}", e);
+                }
+
+                // 2. Memory Execution
+                let events = self.book.cancel_order(order_id, user_id);
+
+                // Broadcast Cancel
+                for event in &events {
+                    let _ = self.event_broadcaster.send(event.clone());
+                }
+
+                let _ = responder.send(events);
+            }
+
+            Command::GetDepth { limit, responder } => {
+                // Read-only command tidak perlu ditulis ke WAL
+                let depth = self.book.get_depth(limit);
+                let _ = responder.send(depth);
+            }
+        }
+    }
+
+    async fn resolve_auctions(&mut self) {
+        let now = std::time::Instant::now();
+        // Cari lelang yang waktunya sudah habis
+        let mut completed_auctions = Vec::new();
+
+        self.active_auctions.retain(|id, auction| {
+            if now >= auction.end_time {
+                completed_auctions.push(auction.clone());
+                false // Hapus dari map aktif
+            } else {
+                true // Pertahankan
+            }
+        });
+
+        // Proses lelang yang selesai
+        for auction in completed_auctions {
+            // Karena BTreeMap diurutkan dari kecil ke besar, kita ambil iter().rev() untuk nilai terbesar
+            if let Some((winning_amount, winning_solver)) = auction.bids.iter().rev().next() {
+                println!(
+                    "🏆 Auction Won! Intent: {}, Solver: {}, Amount: {}",
+                    auction.intent_id, winning_solver, winning_amount
+                );
+
+                // DI SINI KITA MENGIRIMKAN TRANSAKSI PENYELESAIAN KE STATE MACHINE / MEMPOOL
+                // Untuk dikemas dalam batch dan dikirim ke ZK-Prover
+                self.commit_to_state_machine(&auction.intent_id, winning_solver, *winning_amount)
+                    .await;
+            }
+        }
+    }
+
+    async fn commit_to_state_machine(&mut self, intent_id: &str, winning_solver: &str, winning_amount: u64) {
+        println!(
+            "[OFA SETTLEMENT] Meneruskan kemenangan ke State Machine! Intent: {}, Winner: {}, Output: {}",
+            intent_id, winning_solver, winning_amount
+        );
+
+        // TODO untuk integrasi penuh nanti:
+        // Di sini kita bisa membungkus data pemenang menjadi transaksi (TransactionData::ResolveIntent)
+        // lalu menyuntikkannya ke Mempool atau membroadcast EngineEvent::IntentResolved ke WebSocket.
+        // Untuk saat ini, fungsi ini sudah cukup untuk menghentikan error kompilasi dan membuktikan 
+        // lelang berjalan sukses di memori.
     }
 }
