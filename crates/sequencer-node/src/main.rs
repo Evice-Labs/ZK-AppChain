@@ -9,8 +9,9 @@ use axum::{
 };
 use engine::processor::{Command, MarketProcessor};
 use engine::{EngineEvent, Side as EngineSide};
-use settlement::SettlementEngine;
+use std::pin::Pin;
 use std::net::SocketAddr;
+use tokio_stream::{Stream, wrappers::ReceiverStream};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tonic::{transport::Server, Request, Response, Status};
 use trading::trading_engine_server::{TradingEngine, TradingEngineServer};
@@ -274,13 +275,13 @@ impl TradingEngine for TradingService {
         }
 
         // 2. Siapkan channel untuk respon lelang
-        let (resp_tx, resp_rx) = oneshot::channel();
+        let (resp_tx, _resp_rx) = oneshot::channel();
 
         // 3. Kirim Bid ke Engine/Processor yang baru (Kita akan modifikasi ini)
         self.processor_sender
             .send(Command::SubmitBid {
                 solver_id: req.solver_id,
-                intent_id: req.intent_id,
+                intent_id: req.intent_id.clone(),
                 proposed_output_amount: req.proposed_output_amount,
                 estimated_gas_cost: req.estimated_gas_cost,
                 solver_signature: req.solver_signature,
@@ -295,6 +296,22 @@ impl TradingEngine for TradingService {
             message: "Bid queued for OFA evaluation".to_string(),
             auction_id: format!("auc-{}", req.intent_id), // ID lelang berdasarkan ID Intent
         }))
+    }
+
+    // Definisi tipe aliran data untuk gRPC Stream
+    type SubscribeIntentMempoolStream = Pin<Box<dyn Stream<Item = Result<trading::IntentEvent, Status>> + Send>>;
+
+    async fn subscribe_intent_mempool(
+        &self,
+        request: Request<trading::MempoolSubscribeRequest>,
+    ) -> Result<Response<Self::SubscribeIntentMempoolStream>, Status> {
+        let req = request.into_inner();
+
+        // Logika penyambungan asli ke Mempool L2 akan dilakukan di sini nanti.
+        let (_, rx) = tokio::sync::mpsc::channel(128);
+        let output_stream = ReceiverStream::new(rx);
+
+        Ok(Response::new(Box::pin(output_stream) as Self::SubscribeIntentMempoolStream))
     }
 }
 
@@ -360,8 +377,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Channel Broadcast: kapasitas 100 pesan. Jika client lambat, pesan lama didrop (lag).
     let (broadcast_tx, _) = broadcast::channel(100);
 
-    let aegis_url = std::env::var("AEGIS_URL").unwrap_or_else(|_| "https://127.0.0.1:50051".to_string());
-    let _settlement = SettlementEngine::new(aegis_url).await;
+    let l1_rpc_url = std::env::var("L1_RPC_URL").unwrap_or_else(|_| "http://127.0.0.1:8545".to_string());
+    
+    // Inisialisasi engine settlement
+    // (Opsional) Kita bisa memasukkan settlement_engine ini ke dalam Actor/Processor
+    // agar processor bisa memanggil `submit_zk_batch` saat lelang selesai!
+    let _settlement_engine = settlement::SettlementEngine::new(l1_rpc_url).await;
 
     // 2. Spawn Market Processor (The Engine) di background thread
     let processor_broadcast_tx = broadcast_tx.clone();
