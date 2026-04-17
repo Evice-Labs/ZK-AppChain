@@ -1,5 +1,11 @@
 // crates/sequencer-node/src/main.rs
 
+use std::{
+    pin::Pin,
+    net::SocketAddr,
+    str::FromStr,
+    sync::Arc,
+};
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     extract::State,
@@ -7,13 +13,13 @@ use axum::{
     routing::get,
     Router,
 };
+use alloy_primitives::FixedBytes;
 use engine::processor::{Command, MarketProcessor};
 use engine::{EngineEvent, Side as EngineSide};
-use std::pin::Pin;
-use std::net::SocketAddr;
 use tokio_stream::{Stream, wrappers::ReceiverStream};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tonic::{transport::Server, Request, Response, Status};
+use tracing::info;
 use trading::trading_engine_server::{TradingEngine, TradingEngineServer};
 use trading::{
     CancelOrderRequest, CancelOrderResponse, DepthRequest, DepthResponse, ExecutionReport,
@@ -359,6 +365,16 @@ async fn handle_socket(mut socket: WebSocket, broadcast_tx: broadcast::Sender<En
                 "type": "ORDER_CANCELLED",
                 "id": id,
             }),
+            EngineEvent::IntentResolved {
+                intent_id,
+                winning_solver,
+                winning_amount,
+            } => serde_json::json!({
+                "type": "INTENT_RESOLVED",
+                "intent_id": intent_id,
+                "winning_solver": winning_solver,
+                "winning_amount": winning_amount,
+            }),
         };
 
         // Kirim string JSON ke Client WebSocket
@@ -377,42 +393,95 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Channel Broadcast: kapasitas 100 pesan. Jika client lambat, pesan lama didrop (lag).
     let (broadcast_tx, _) = broadcast::channel(100);
 
+    // 2. Ambil variabel dari .env atau environment
     let l1_rpc_url = std::env::var("L1_RPC_URL").unwrap_or_else(|_| "http://127.0.0.1:8545".to_string());
     
-    // Inisialisasi engine settlement
+    // Private Key dummy Anvil (Account #0) untuk development
+    let private_key = std::env::var("SEQUENCER_PRIVATE_KEY")
+        .unwrap_or_else(|_| "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".to_string());
+    
+    // Address kontrak EviceRollup setelah di-deploy di Anvil
+    let rollup_address = std::env::var("ROLLUP_CONTRACT_ADDRESS")
+        .unwrap_or_else(|_| "0x5FbDB2315678afecb367f032d93F642f64180aa3".to_string());
+    
+    // 3. Inisialisasi engine settlement
     // (Opsional) Kita bisa memasukkan settlement_engine ini ke dalam Actor/Processor
     // agar processor bisa memanggil `submit_zk_batch` saat lelang selesai!
-    let _settlement_engine = settlement::SettlementEngine::new(l1_rpc_url).await;
+    let settlement_engine = Arc::new(
+        settlement::SettlementEngine::new(l1_rpc_url, private_key, rollup_address).await
+    );
 
-    // 2. Spawn Market Processor (The Engine) di background thread
+    // 4. Channel untuk Event Latar Belakang (Jembatan Engine -> L1)
+    let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel(1024);
+    
     let processor_broadcast_tx = broadcast_tx.clone();
-    let mut processor = MarketProcessor::new(rx, processor_broadcast_tx);
-    tokio::spawn(async move {
-        processor.run().await;
+
+    // 5. Inisialisasi Market Processor 
+    let mut processor = engine::processor::MarketProcessor::new(
+        rx, 
+        processor_broadcast_tx,
+        outbound_tx
+    );
+    tokio::spawn(async move { 
+        processor.run().await; 
     });
 
-    // 3. Setup WebSocket Server (Axum)
-    // Berjalan di port terpisah: 3000
-    let app = Router::new()
-        .route("/ws", get(ws_handler))
-        .with_state(broadcast_tx.clone());
+    // 6. THE SETTLEMENT TASK (Menangkap kabel dari Engine dan menembaknya ke L1)
+    let engine_clone = settlement_engine.clone();
+    tokio::spawn(async move {
+        info!("Settlement Background Task listening for OFA events...");
+        
+        while let Some(event) = outbound_rx.recv().await {
+            match event {
+                // Tangkap event kemenangan lelang
+                EngineEvent::IntentResolved { intent_id, winning_solver, winning_amount } => {
+                    info!("Meneruskan Intent {} ke Ethereum L1...", intent_id);
 
-    let ws_addr = SocketAddr::from(([127, 0, 0, 1], 3000));
-    println!(">>> WebSocket Market Data Server Listening on ws://127.0.0.1:3000/ws");
+                    // A. Di sistem produksi, kita memanggil ZK-Prover di sini.
+                    // Untuk saat ini, kita buat dummy proof & state root
+                    let dummy_state_root = [0u8; 32]; 
+                    let dummy_proof = vec![1, 2, 3, 4, 5]; // Dummy Plonky3 Proof
+                    
+                    // Konversi string intent_id menjadi byte32 
+                    // (Diasumsikan intent_id adalah representasi hex 32 byte)
+                    let intent_bytes = FixedBytes::<32>::from_str(&intent_id)
+                        .unwrap_or(FixedBytes::<32>::ZERO);
 
-    // Spawn Axum server di background task
+                    // B. Buat Settlement Batch
+                    let batch = settlement::SettlementBatch {
+                        new_state_root: dummy_state_root,
+                        proof: dummy_proof,
+                        resolved_intent_ids: vec![intent_bytes.0],
+                    };
+
+                    // C. TEMBAK KE L1 SECARA ASINKRON!
+                    engine_clone.submit_zk_batch(batch).await;
+                }
+                _ => { /* Abaikan event lain seperti OrderPlaced */ }
+            }
+        }
+    });
+
+    // 7. Setup WebSocket Server (Axum)
+    let app = axum::Router::new()
+        .route("/ws", axum::routing::get(ws_handler))
+        .with_state(broadcast_tx); 
+
+    let ws_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 3000));
+    info!(">>> WebSocket Market Data Server Listening on ws://127.0.0.1:3000/ws");
+
     tokio::spawn(async move {
         let listener = tokio::net::TcpListener::bind(ws_addr).await.unwrap();
         axum::serve(listener, app).await.unwrap();
     });
 
-    // 4. Setup gRPC Server (Main Task)
+    // 8. Setup gRPC Server (Main Task)
     let addr = "[::1]:50051".parse()?;
     let trading_service = TradingService {
         processor_sender: tx,
     };
 
-    println!("Velocity DEX Engine listening on {}", addr);
+    info!("DEX Engine listening on {}", addr);
 
     Server::builder()
         .add_service(TradingEngineServer::new(trading_service))
