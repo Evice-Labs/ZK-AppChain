@@ -1,9 +1,10 @@
 // crates/engine-core/src/wal.rs
 
-use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Write};
 use anyhow::Result;
 use bincode::config;
+use std::fs::{File, OpenOptions};
+use std::io::{BufReader, BufWriter, Write};
+
 use crate::LogEntry;
 
 pub struct WalHandler {
@@ -26,11 +27,7 @@ impl WalHandler {
     // Menulis satu entry ke disk
     pub fn write_entry(&mut self, entry: &LogEntry) -> Result<()> {
         // Serialize langsung ke buffer writer
-        bincode::serde::encode_into_std_write(
-            entry, 
-            &mut self.writer, 
-            config::standard() 
-        )?;
+        bincode::serde::encode_into_std_write(entry, &mut self.writer, config::standard())?;
 
         // Untuk HFT murni, biasanya flush dilakukan per batch atau interval waktu
         // Pada skala seperti ini, flush setiap kali demi keamanan data
@@ -45,7 +42,7 @@ impl WalHandler {
         if file.is_err() {
             return Ok(Vec::new());
         }
-        
+
         let file = file.unwrap();
         let mut reader = BufReader::new(file);
         let mut entries = Vec::new();
@@ -53,10 +50,8 @@ impl WalHandler {
         loop {
             // decode_from_std_read mengembalikan Result<T, DecodeError>
             // disini menentukan tipe T secara eksplisit atau via inferensi
-            let result: Result<LogEntry, _> = bincode::serde::decode_from_std_read(
-                &mut reader, 
-                config::standard()
-            );
+            let result: Result<LogEntry, _> =
+                bincode::serde::decode_from_std_read(&mut reader, config::standard());
 
             match result {
                 Ok(entry) => {

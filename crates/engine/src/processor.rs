@@ -5,6 +5,7 @@ use tokio::{
     sync::{broadcast, mpsc},
     time::{interval, Duration},
 };
+use tracing::{info, warn, error};
 
 use crate::wal::WalHandler;
 use crate::{EngineEvent, LogEntry, OrderBook, OrderLevel, Side};
@@ -62,6 +63,7 @@ pub struct MarketProcessor {
     receiver: mpsc::Receiver<Command>,
     wal: WalHandler,
     active_auctions: HashMap<String, Auction>,
+    outbound_events: mpsc::Sender<EngineEvent>,
     pub event_broadcaster: broadcast::Sender<EngineEvent>,
 }
 
@@ -69,16 +71,17 @@ impl MarketProcessor {
     pub fn new(
         receiver: mpsc::Receiver<Command>,
         broadcaster: broadcast::Sender<EngineEvent>,
+        outbound_events: mpsc::Sender<EngineEvent>,
     ) -> Self {
         let wal_path = "velocity.wal";
 
         // 1. Recovery Phase
-        println!("Recovering state from WAL...");
+        info!("Recovering state from WAL...");
         let mut book = OrderBook::new();
 
         // Load log lama jika ada
         if let Ok(entries) = WalHandler::read_all(wal_path) {
-            println!("Replaying {} events...", entries.len());
+            info!("Replaying {} events...", entries.len());
             for entry in entries {
                 match entry {
                     LogEntry::Place {
@@ -96,7 +99,7 @@ impl MarketProcessor {
                 }
             }
         } else {
-            println!("No WAL found, starting fresh.");
+            warn!("No WAL found, starting fresh.");
         }
 
         // 2. Open WAL for Writing
@@ -107,6 +110,7 @@ impl MarketProcessor {
             receiver,
             wal,
             active_auctions: HashMap::new(),
+            outbound_events,
             event_broadcaster: broadcaster,
         }
     }
@@ -168,7 +172,7 @@ impl MarketProcessor {
                 };
 
                 if let Err(e) = self.wal.write_entry(&log_entry) {
-                    eprintln!("CRITICAL: Failed to write to WAL: {}", e);
+                    error!("CRITICAL: Failed to write to WAL: {}", e);
                 }
 
                 // 2. Mmemory Execution
@@ -206,7 +210,7 @@ impl MarketProcessor {
                     };
 
                     if let Err(e) = self.wal.write_entry(&log_entry) {
-                        eprintln!("WAL Write Error: {}", e);
+                        error!("WAL Write Error: {}", e);
                         // Dalam produksi, bisa break/panic disini
                     }
 
@@ -242,7 +246,7 @@ impl MarketProcessor {
                 let log_entry = LogEntry::Cancel { order_id, user_id };
 
                 if let Err(e) = self.wal.write_entry(&log_entry) {
-                    eprintln!("CRITICAL: Failed to write to WAL: {}", e);
+                    error!("CRITICAL: Failed to write to WAL: {}", e);
                 }
 
                 // 2. Memory Execution
@@ -282,29 +286,39 @@ impl MarketProcessor {
         for auction in completed_auctions {
             // Karena BTreeMap diurutkan dari kecil ke besar, kita ambil iter().rev() untuk nilai terbesar
             if let Some((winning_amount, winning_solver)) = auction.bids.iter().rev().next() {
-                println!(
-                    "🏆 Auction Won! Intent: {}, Solver: {}, Amount: {}",
+                info!(
+                    "Auction Won! Intent: {}, Solver: {}, Amount: {}",
                     auction.intent_id, winning_solver, winning_amount
                 );
 
                 // DI SINI KITA MENGIRIMKAN TRANSAKSI PENYELESAIAN KE STATE MACHINE / MEMPOOL
                 // Untuk dikemas dalam batch dan dikirim ke ZK-Prover
-                self.commit_to_state_machine(&auction.intent_id, winning_solver, *winning_amount)
-                    .await;
+                self.commit_to_state_machine(&auction.intent_id, winning_solver, *winning_amount).await;
             }
         }
     }
 
-    async fn commit_to_state_machine(&mut self, intent_id: &str, winning_solver: &str, winning_amount: u64) {
-        println!(
-            "[OFA SETTLEMENT] Meneruskan kemenangan ke State Machine! Intent: {}, Winner: {}, Output: {}",
+    // Mencatat hasil kemenangan lelang OFA
+    async fn commit_to_state_machine(
+        &mut self, 
+        intent_id: &str, 
+        winning_solver: &str, 
+        winning_amount: u64
+    ) {
+        info!(
+            "[OFA SETTLEMENT] Lelang Dimenangkan! Intent: {}, Winner: {}, Output: {}",
             intent_id, winning_solver, winning_amount
         );
 
-        // TODO untuk integrasi penuh nanti:
-        // Di sini kita bisa membungkus data pemenang menjadi transaksi (TransactionData::ResolveIntent)
-        // lalu menyuntikkannya ke Mempool atau membroadcast EngineEvent::IntentResolved ke WebSocket.
-        // Untuk saat ini, fungsi ini sudah cukup untuk menghentikan error kompilasi dan membuktikan 
-        // lelang berjalan sukses di memori.
+        // KIRIM EVENT KE BACKGROUND TASK L1
+        let event = EngineEvent::IntentResolved {
+            intent_id: intent_id.to_string(),
+            winning_solver: winning_solver.to_string(),
+            winning_amount,
+        };
+
+        if let Err(e) = self.outbound_events.send(event).await {
+            error!("Gagal mengirim event IntentResolved ke L1 Task: {}", e);
+        }
     }
 }

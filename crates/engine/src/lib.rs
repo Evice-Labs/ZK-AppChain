@@ -56,6 +56,11 @@ pub enum EngineEvent {
         price: Price,
         quantity: Quantity,
     },
+    IntentResolved {
+        intent_id: String,
+        winning_solver: String,
+        winning_amount: u64,
+    },
 }
 
 #[derive(Debug, Clone)]
